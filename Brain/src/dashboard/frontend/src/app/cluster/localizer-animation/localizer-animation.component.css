@@ -1,0 +1,38 @@
+.anim-container {
+  display: flex;
+  flex-direction: column;
+  background: #111;
+  border: 1px solid #333;
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.anim-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 4px 8px;
+  background: #1a1a1a;
+  font-family: monospace;
+  font-size: 12px;
+}
+
+.anim-title {
+  color: #aaa;
+}
+
+.anim-mode {
+  font-weight: bold;
+  padding: 1px 6px;
+  border-radius: 4px;
+}
+
+.mode-GLOBAL  { color: #facc15; }
+.mode-LOCAL   { color: #4ade80; }
+.mode-RECOVER { color: #fb923c; }
+
+canvas {
+  display: block;
+  width: 100%;
+  height: auto;
+}

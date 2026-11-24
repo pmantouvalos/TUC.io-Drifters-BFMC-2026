@@ -1,0 +1,1405 @@
+import time
+import math
+import socket
+import json
+import numpy as np
+from collections import deque, Counter
+import ast
+from src.templates.threadwithstop import ThreadWithStop
+from src.utils.messages.messageHandlerSubscriber import messageHandlerSubscriber
+from src.utils.messages.messageHandlerSender import messageHandlerSender
+from src.control.utils.controlMode import ControlMode
+from src.statemachine.stateMachine import StateMachine
+#from src.localization.Localizer import EKF
+from src.data.TrafficCommunication.useful.sharedMem import sharedMem
+from src.utils.messages.allMessages import (
+    CurrentSpeed,  # SPEED TO GIVE TO DTHE SERVER
+    ImuData,  # ROTATION AND OTHER BULLSHIT TO GIVE TO THE SERVER
+    SteerMotor,
+    SpeedMotor,
+    VisionManeuver,
+    StateChange,
+    Klem,
+    JoyAxes,
+    JoyButton,
+    TOFRear,
+    TOFLeft,
+    TOFRight,
+    TOFForward,  # NEW AND SHINYf
+    ObjectDetect,
+    ParkingScanGate,
+    Semaphores,  # V2X — semaphore state (processSemaphores)
+    Location,  # V2X — localization (processTrafficCommunication)
+    NavigateTo,  # Dashboard → go to specific node
+    CurrentNode,
+    IntersectionMask,  # Controller → current nearest node (for dashboard display)
+    LeftLineClassifier,
+    RightLineClassifier,
+    NavCommand
+)
+from src.pathplanning.pathPlanner import PathPlanner
+
+class TrajectoryFollower:
+    def __init__(self):
+        # Left Turn Coefficients (Generated with K=0.75, start=0.55, end=0.30)
+        self.coeffs_x_left = [-2.6856, 1.4927, 0.0000, 4.9926]
+        self.coeffs_y_left = [2.6759, -6.5496, 5.0715, 5.8022]
+
+        # Right Turn Coefficients (Generated with K=1.0, start=0.48, end=0.40)
+        self.coeffs_x_right = [-0.4811, 1.3647, 0.0000, 2.9161]
+        self.coeffs_y_right = [0.3301, -1.2670, 1.5435, 3.1733]
+
+        # Forward / Straight Coefficients (Generated with K=1.0, start=0.5, end=0.5)
+        self.coeffs_x_forward = [0.0000, 0.0000, 0.0000, 5.0074]
+        self.coeffs_y_forward = [0.0165, 0.0000, 1.6324, 3.1578]
+
+        self.L_WHEELBASE = 0.255 # Wheelbase in meters
+        self.reset("forward")
+
+    def reset(self, direction="forward"):
+        self.is_active = False
+        self.t_current = 0.0
+        self.car_pos_local = np.array([0.0, 0.0])
+        
+        self.current_direction = direction
+
+        if direction == "right":
+            self.coeffs_x = self.coeffs_x_right
+            self.coeffs_y = self.coeffs_y_right
+        elif direction == "left":
+            self.coeffs_x = self.coeffs_x_left
+            self.coeffs_y = self.coeffs_y_left
+        else: # Forward / Straight
+            self.coeffs_x = self.coeffs_x_forward
+            self.coeffs_y = self.coeffs_y_forward
+            
+        self.START_POS_TRACK = np.array([self.coeffs_x[3], self.coeffs_y[3]])
+        
+        dx = 3*self.coeffs_x[0]*0**2 + 2*self.coeffs_x[1]*0 + self.coeffs_x[2]
+        dy = 3*self.coeffs_y[0]*0**2 + 2*self.coeffs_y[1]*0 + self.coeffs_y[2]
+        self.car_yaw = math.atan2(dy, dx)
+        self.last_time = time.time()
+        self.math_steering_rad = 0.0 
+
+    def start_turn(self, direction="forward"):
+        self.reset(direction)
+        self.is_active = True
+        self.last_time = time.time()
+
+    def get_path_point(self, t):
+        x = self.coeffs_x[0]*t**3 + self.coeffs_x[1]*t**2 + self.coeffs_x[2]*t + self.coeffs_x[3]
+        y = self.coeffs_y[0]*t**3 + self.coeffs_y[1]*t**2 + self.coeffs_y[2]*t + self.coeffs_y[3]
+        return np.array([x, y])
+
+    def update(self, stanley_gain):
+        if not self.is_active: return 0.0
+        current_time = time.time()
+        dt = current_time - self.last_time
+        self.last_time = current_time
+        
+        v_m_s = 0.20
+        
+        # 1. Update Kinematics (Bicycle Model)
+        self.car_yaw += (v_m_s / self.L_WHEELBASE) * math.tan(self.math_steering_rad) * dt
+        self.car_pos_local[0] += v_m_s * math.cos(self.car_yaw) * dt
+        self.car_pos_local[1] += v_m_s * math.sin(self.car_yaw) * dt
+
+        current_global_pos = self.car_pos_local + self.START_POS_TRACK
+        
+        # 2. Find nearest point on curve (t_current)
+        t_search = np.linspace(self.t_current, min(1.0, self.t_current + 0.2), 50)
+        dists = [np.linalg.norm(current_global_pos - self.get_path_point(t)) for t in t_search]
+        self.t_current = t_search[np.argmin(dists)]
+
+        if self.t_current >= 0.98: 
+            self.is_active = False
+
+        # ==========================================
+        # 3. Calculate Math Errors 
+        # ==========================================
+        
+        # A. Cross-Track Error (Current Position)
+        current_point = self.get_path_point(self.t_current)
+        dx_curr = 3*self.coeffs_x[0]*self.t_current**2 + 2*self.coeffs_x[1]*self.t_current + self.coeffs_x[2]
+        dy_curr = 3*self.coeffs_y[0]*self.t_current**2 + 2*self.coeffs_y[1]*self.t_current + self.coeffs_y[2]
+        current_yaw = math.atan2(dy_curr, dx_curr)
+        
+        e = ((current_global_pos[0] - current_point[0]) * math.sin(current_yaw) - 
+             (current_global_pos[1] - current_point[1]) * math.cos(current_yaw))
+             
+        # B. Heading Error (Look Ahead)
+        t_target = self.t_current + 0.15 
+        dx_targ = 3*self.coeffs_x[0]*t_target**2 + 2*self.coeffs_x[1]*t_target + self.coeffs_x[2]
+        dy_targ = 3*self.coeffs_y[0]*t_target**2 + 2*self.coeffs_y[1]*t_target + self.coeffs_y[2]
+        target_yaw = math.atan2(dy_targ, dx_targ)
+        
+        theta_e_rad = (target_yaw - self.car_yaw + math.pi) % (2 * math.pi) - math.pi
+
+        # 4. Pure Mathematical Stanley Control
+        delta = theta_e_rad + math.atan2(stanley_gain * e, v_m_s)
+        
+        # 5-Degree Feed-Forward Kick (ONLY for turns, disabled for going straight)
+        if self.t_current < 0.20:
+            if self.current_direction == "right":
+                delta -= math.radians(5.0) 
+            elif self.current_direction == "left":
+                delta += math.radians(5.0) 
+
+        MAX_STEER = math.radians(25)
+        delta = max(-MAX_STEER, min(MAX_STEER, delta))
+        self.math_steering_rad = delta
+
+        return math.degrees(-delta)
+    
+    
+# ═════════════════════════════════════════════════════════════════════════════
+# CONTROL CONFIG
+# ═════════════════════════════════════════════════════════════════════════════
+
+AXES_MAX = 1023
+STEERING_MIN = -250
+STEERING_MAX = 250
+THROTTLE_MIN = -500
+THROTTLE_MAX = 500
+STEERING_DEADBAND = 15
+THROTTLE_DEADBAND = 20
+
+# ═════════════════════════════════════════════════════════════════════════════
+# SPEEDS CONFIG FOR FUTURE USE
+# ═════════════════════════════════════════════════════════════════════════════
+
+NORMAL_SPEED = 200
+HIGHWAY_SPEED = 400
+PARKING_SPEED = 150
+OVERTAKE_SPEED = 500
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PARKING CONFIG
+# ═════════════════════════════════════════════════════════════════════════════
+
+PARK_SIGN_SPEED = 150
+PARK_BLIND_DURATION = 1.5
+PARK_ENTER_BLIND_DURATION = 4.0
+PARK_SCAN_DELAY = 0.3
+PARK_FREE_CONFIRM = 1.2
+PARK_ALL_FREE_DELAY = 2.5
+PARK_HALF_LEN_TIME = 0.8
+PARK_REVERSE_SPEED = -150
+PARK_STEER_ANGLE = 250
+PARK_CORRECT_ANGLE = -250
+PARK_SAFE_REAR = 70  # mm — if rear ToF reads below this, we consider the car safely in the spot and can stop reversing
+PARK_REVERSE_TIMEOUT = 3.5
+PARK_CORRECT_TIMEOUT = 3.0
+PARK_FWD_SPEED = 100
+PARK_FWD_TIMEOUT = 2.5
+PARK_STOP_WAIT = 5.0
+UNPARK_SPEED = 150
+UNPARK_DURATION = 3.0
+PARK_COOLDOWN = 60.0
+PARK_FREE_SPOT_TIME = (
+    740 / PARK_SIGN_SPEED
+)  # kept for reference, not used in main logic
+
+# ── Transition-based spot detection ──────────────────────────────────────────
+# How many consecutive frames a side must read OCC to be "confirmed occupied"
+PARK_OCC_CONFIRM_FRAMES = 3
+# How many consecutive frames a side must read FREE (after OCC) to commit
+PARK_FREE_CONFIRM_FRAMES = 2
+# Extra forward crawl AFTER spot confirmed, before starting the maneuver.
+# At PARK_CRAWL_SPEED=150 (~15cm/s):
+#   One spot length (80cm) = 5.33s
+#   + half car length extra ≈ 2.5s
+#   Total ≈ 8.0s  (tune ±1s on track)
+PARK_EXTRA_FWD_TIME = 2.0
+# Speed during the extra-forward crawl (motor units)
+PARK_CRAWL_SPEED = 150
+
+# ── ToF Robustness ────────────────────────────────────────────────────────────
+# Rolling median window size (number of recent readings to smooth over)
+TOF_BUFFER_SIZE = 7
+
+# Hysteresis thresholds (mm):
+#   A sensor is considered FREE  only when median rises ABOVE TOF_FREE_HIGH
+#   A sensor is considered OCCUP only when median falls BELOW TOF_FREE_LOW
+#   In between → state does not change (hysteresis dead-band)
+TOF_FREE_HIGH = 300  # mm — must exceed this to switch to "free"
+TOF_FREE_LOW = 300  # mm — must drop below this to switch to "occupied"
+
+# Grace frames: consecutive "wrong-condition" cycles tolerated before
+# resetting the spot timer.  Absorbs 1–4 frame glitches/reflections.
+PARK_GRACE_FRAMES = 4
+
+# ═════════════════════════════════════════════════════════════════════════════
+# OVERTAKE CONFIG
+# ═════════════════════════════════════════════════════════════════════════════
+
+STEER_LEFT_TIME = 1
+STEER_RIGHT_TIME = 1
+RIGHT_STEER = 250
+LEFT_STEER = -500
+
+
+passing_from_left = False
+passing_from_right = False
+
+# ═════════════════════════════════════════════════════════════════════════════
+# HIGHWAY STUFF
+# ═════════════════════════════════════════════════════════════════════════════
+
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PATH PLANNING CONFIG
+# ═════════════════════════════════════════════════════════════════════════════
+
+GRAPHML_PATH = "src/pathplanning/Competition_track_graph.graphml"
+WAYPOINT_THRESHOLD = 0.35  # meters — distance to consider a node "reached"
+
+ROLLING_CHECKPOINTS = [
+    "192",
+    "248",
+    "257",
+    "54",
+    "291",
+    "200",
+    "6",
+    "301",
+    "42",
+    "201",
+    "290",
+]
+
+# ═════════════════════════════════════════════════════════════════════════════
+# OBSTACLE IDs (BFMC documentation table)
+# ═════════════════════════════════════════════════════════════════════════════
+
+OBSTACLE_IDS = {
+    "Stop": 1,
+    "Priority": 2,
+    "Parking": 3,
+    "Crosswalk": 4,
+    "STOP_LINE": 4,
+    "HighwayEntry": 5,
+    "HighwayExit": 6,
+    "Roundabout": 7,
+    "Pedestrian": 11,
+    "Car": 10,
+}
+
+# ═════════════════════════════════════════════════════════════════════════════
+
+
+def constrain_num(val, min_val, max_val):
+    return min(max_val, max(min_val, val))
+
+
+def map_range(x, in_min, in_max, out_min, out_max):
+    tmp_x = min(in_max, max(in_min, x))
+    return (tmp_x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+class threadcontroller(ThreadWithStop):
+    """
+    Main controller thread — full version with:
+      ✦ Lane keeping (Stanley controller από OAK-D)
+      ✦ Stop signs, crosswalks, pedestrians, highway, parking
+      ✦ V2X semaphore support (stops on RED)
+      ✦ V2X localization (DWM1001 via processTrafficCommunication)
+      ✦ Rolling target path planning (Dijkstra)
+      ✦ Obstacle reporting to TrafficComm server
+      ✦ Telemetry UDP → visualization.py
+    """
+
+    detections = []
+    stop_buffer = np.array([0, 0, 0, 0, 0])
+    index = 0
+    seen_stop = False
+
+    def __init__(self, sharedMemory, queueList, logging, debugging=False):
+        try:
+            super(threadcontroller, self).__init__(pause=0.03)
+            self.queuesList = queueList
+            self.logging = logging
+            self.debugging = debugging
+            self.seen_stop_sign = False
+
+            self.stateMachine = StateMachine.get_instance()
+            self.control_mode = ControlMode.INIT
+            self.act_enabled = False
+            self._klem_received = False
+
+            self.highway_flag = False
+            self._has_started = False
+
+            self.sharedMemory = sharedMemory  # IT WORKS. IT DOESNT SUCK. DONT REMOVE IT
+
+            # ── Subscribers ───────────────────────────────────────────────
+            self.klSubscriber = messageHandlerSubscriber(
+                self.queuesList, Klem, "lastOnly", True
+            )
+            self.joyAxesSubscriber = messageHandlerSubscriber(
+                self.queuesList, JoyAxes, "lastOnly", True
+            )
+            self.joyButtonSubscriber = messageHandlerSubscriber(
+                self.queuesList, JoyButton, "lastOnly", True
+            )
+            self.stateChangeSubscriber = messageHandlerSubscriber(
+                self.queuesList, StateChange, "lastOnly", True
+            )
+            self.visionManeuverSubscriber = messageHandlerSubscriber(
+                self.queuesList, VisionManeuver, "lastOnly", True
+            )
+            self.tofRearSubscriber = messageHandlerSubscriber(
+                self.queuesList, TOFRear, "lastOnly", True
+            )
+            self.tofLeftSubscriber = messageHandlerSubscriber(
+                self.queuesList, TOFLeft, "lastOnly", True
+            )
+            self.tofRightSubscriber = messageHandlerSubscriber(
+                self.queuesList, TOFRight, "lastOnly", True
+            )
+            self.tofForwardSubscriber = messageHandlerSubscriber(
+                self.queuesList, TOFForward, "lastOnly", True
+            )
+            self.objectDetectSubscriber = messageHandlerSubscriber(
+                self.queuesList, ObjectDetect, "lastOnly", True
+            )
+
+            self.currentSpeedSubscriber = messageHandlerSubscriber(
+                self.queuesList, CurrentSpeed, "lastOnly", True
+            )
+            self.imuSubscriber = messageHandlerSubscriber(
+                self.queuesList, ImuData, "lastOnly", True
+            )
+            self.leftLineClassifierSubscriber = messageHandlerSubscriber(
+                self.queuesList, LeftLineClassifier, "lastOnly", True
+            )
+            self.rightLineClassifierSubscriber = messageHandlerSubscriber(
+                self.queuesList, RightLineClassifier, "lastOnly", True
+            )
+
+            self.navCommandSubscriber = messageHandlerSubscriber(
+                self.queuesList, NavCommand, "lastOnly", True
+            )
+
+            # ── V2X Subscribers ────────────────────────────────────────────
+            self.semaphoresSubscriber = messageHandlerSubscriber(
+                self.queuesList, Semaphores, "lastOnly", True
+            )
+            self.locationSubscriber = messageHandlerSubscriber(
+                self.queuesList, Location, "lastOnly", True
+            )
+            self.navigateToSubscriber = messageHandlerSubscriber(
+                self.queuesList, NavigateTo, "lastOnly", True
+            )
+            self.intersectionMaskSubscriber = messageHandlerSubscriber(
+                self.queuesList, IntersectionMask, "lastOnly", True
+            )
+            
+
+            # ── Cached ToF ────────────────────────────────────────────────
+            self.tof_rear = (
+                9999
+            )  # CHANGED FROM NONE BECAUSE STUPID NONE CAUSES TOO MANY PROBLEMS AND THEY ARE ANNOYING TO DEAL WITH
+            self.tof_left = 9999
+            self.tof_right = 9999
+            self.tof_forward = 9999
+            # ── ToF Robustness (rolling median + hysteresis) ───────────────
+            self._tof_left_buf = deque(maxlen=TOF_BUFFER_SIZE)
+            self._tof_right_buf = deque(maxlen=TOF_BUFFER_SIZE)
+            # Hysteresis state: True = free, False = occupied
+            # Default False (occupied) = safe: won't commit to parking prematurely
+            self._tof_left_free = False
+            self._tof_right_free = False
+            # Grace counter: counts consecutive cycles where condition differs
+            # from the committed one, before we allow a timer reset
+            self._park_grace_counter = 0
+
+            # ── Publishers ────────────────────────────────────────────────
+            self.steerMotorSender = messageHandlerSender(self.queuesList, SteerMotor)
+            self.speedMotorSender = messageHandlerSender(self.queuesList, SpeedMotor)
+            self.parkingScanSender = messageHandlerSender(
+                self.queuesList, ParkingScanGate
+            )
+            self.currentNodeSender = messageHandlerSender(self.queuesList, CurrentNode)
+            self._last_published_node = None
+
+            # ── V2X State ──────────────────────────────────────────────────
+            self.semaphore_states = {}
+            self.nearest_semaphore_state = -1
+            self.car_x = 0.0
+            self.car_y = 0.0
+            self.loc_quality = 0
+
+            self.shared_mem = None
+            self._last_speed = 0
+            self._last_steering_cmd = "0"
+            self._last_detection = None
+            self.car_last_seen_time = None
+            
+            # DEFAULT ΠΛΟΗΓΗΣΗΣ "front" (ΜΕΧΡΙ ΝΑ ΤΟ ΑΛΛΑΞΕΙ ΤΟ NAVCOMMANDER)
+            self.next_instruction = "right"
+            self.lane_preference = "center"
+            self.INTERSECTION_NODES = [
+                "94",
+                "21",
+                "9",
+                "103",
+                "33",
+                "45",
+                "76",
+                "200",
+                "85",
+                "57",
+                "207",
+                "78",
+                "210",
+                "59",
+                "22",
+                "48",
+                "35",
+                "95",
+                "105",
+                "96",
+                "11",
+                "104",
+                "36",
+                "46",
+                "47",
+                "290",
+                "77",
+                "60",
+                "23",
+                # "333", "335", "338", "341",  # ROUNDABOUT NODES
+            ]
+
+            # ── Roundabout State (ΝΕΕΣ ΜΕΤΑΒΛΗΤΕΣ) ────────────────────────
+            self.target_roundabout_exit = 2
+            self.passed_exits = 0
+            self._roundabout_yield_start = None
+            self._roundabout_exit_start = None
+            self._right_line_was_visible = True
+            self._right_line_lost_frames = 0
+
+
+
+            # -----  SPEED STATE -----------------
+
+
+            # --- NEΕΣ ΜΕΤΑΒΛΗΤΕΣ IMU ---
+            self.current_yaw = 0.0
+            self.accumulated_yaw = 0.0
+            self.last_yaw = 0.0
+
+
+
+
+
+
+
+            # -----  SPEED STATE -----------------
+            self.speed_state = None
+
+            self.trajectory_follower = TrajectoryFollower()
+
+            # ── Path Planning — Rolling Target ─────────────────────────────
+            try:
+                self.planner = PathPlanner(GRAPHML_PATH)
+            except Exception as e:
+                print(
+                    f"\033[1;97m[ Controller Thread ] :\033[0m "
+                    f"\033[1;93mWARN\033[0m - PathPlanner: {e}"
+                )
+                self.planner = None
+
+            self.current_path = []
+            self.current_node_idx = 0
+            self._checkpoint_idx = 0
+            self.target_node_id = ROLLING_CHECKPOINTS[0]
+            self.path_heading = None
+            self._fixed_target = False  # True = navigate to single node, then stop
+
+            # ── Parking State ─────────────────────────────────────────────
+            self._park_sign_seen_time = None
+            self._park_scan_active = False
+            self._park_seen_wall = False
+            self._park_side = None
+            self._park_free_confirm = None
+            self._park_all_free_timer = None
+            self._park_position_start = None
+            self._park_reverse_start = None
+            self._park_correct_start = None
+            self._park_fwd_start = None
+            self._park_stop_time = None
+            self._unpark_start_time = None
+            self._parking_completed = False
+            self._parking_done_time = None
+            self._parking_spot_detection_time = None
+            self._parking_move_fwd_bfr_maneuver = None
+            self._park_blind_enter_time = None
+            self._last_parking_condition = None
+
+            # -- Stop line state (for FIND_STOP_LINE)
+            self._searching_for_stop_line = False
+            self._last_printed_mode = None
+            self._stop_timer = None  # THIS FIXES THE STOP_SIGN ERROR
+
+            # ── Transition-based spot detection counters ───────────────────
+            self._occ_frames_left = 0
+            self._occ_frames_right = 0
+            self._free_frames_left = 0
+            self._free_frames_right = 0
+            self._wall_seen_left = False
+            self._wall_seen_right = False
+            self._park_commit_time = None
+            self._park_align_start = None
+            # Continuous FREE timers — reset to None on any OCC reading
+            self._free_timer_left = None
+            self._free_timer_right = None
+
+            # ── Intersection timers ────────────────────────────────────────
+            self.fwd_start = None
+            self.turn_start = None
+            self._intersection_scan_start = None
+            self._mask_buffer = []
+
+            # --- OVERTAKE TIMERS ------------------
+            self.overtake_start = None
+            self.overtake_correct = None
+
+            # ── ROLLING SEMAPHORE FINGERPRINTING ──────────────────────────
+            self._semaphore_suspects = []
+            self._pending_visual_state = None
+            self._current_visual_state = None
+            self._visual_state_timer = None
+            self._converged_semaphore_id = None
+            self._blind_fallback_timer = None
+            self._fingerprint_active = False
+
+            # ── Subscribe list ─────────────────────────────────────────────
+            self.subscribe_list = [
+                self.klSubscriber,
+                self.joyAxesSubscriber,
+                self.joyButtonSubscriber,
+                self.stateChangeSubscriber,
+                self.visionManeuverSubscriber,
+                self.tofRearSubscriber,
+                self.tofLeftSubscriber,
+                self.tofRightSubscriber,
+                self.tofForwardSubscriber,
+                self.semaphoresSubscriber,
+                self.locationSubscriber,
+                self.navigateToSubscriber,
+                self.currentSpeedSubscriber,
+                self.imuSubscriber,
+                self.intersectionMaskSubscriber,
+                self.leftLineClassifierSubscriber,
+                self.rightLineClassifierSubscriber,
+                self.navCommandSubscriber
+            ]
+
+            # ── Telemetry UDP sender → visualization.py ───────────────────
+            try:
+                self._telem_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                self._telem_sock.setblocking(False)
+                self._telem_ip = "192.168.50.100"
+                self._telem_port = 9002
+            except Exception:
+                self._telem_sock = None
+
+            print(
+                "\033[1;97m[ Controller Thread ] :\033[0m \033[1;92mINFO\033[0m"
+                " - Controller initialized (V2X + Rolling Target)"
+            )
+
+        except Exception as e:
+            self.try_unsubscribe()
+            print(
+                f"\033[1;97m[ Controller Thread ] :\033[0m \033[1;91mERROR\033[0m"
+                f" - Failed: {e}"
+            )
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # STATE CHANGE HANDLER
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def state_change_handler(self):
+        message = self.stateChangeSubscriber.receive()
+        if message is not None:
+            match message:
+                case "DEFAULT" | "STOP" | "LEGACY":
+                    self.control_mode = ControlMode.INIT
+                    print(
+                        f"\033[1;97m[ Controller Thread ] :\033[0m "
+                        f"\033[1;92mINFO\033[0m - Mode → {message}"
+                    )
+                case "MANUAL":
+                    self.control_mode = ControlMode.MANUAL
+                    print(
+                        "\033[1;97m[ Controller Thread ] :\033[0m "
+                        "\033[1;92mINFO\033[0m - Mode → MANUAL"
+                    )
+                case "AUTO":
+                    self.control_mode = ControlMode.AUTO
+                    print(
+                        "\033[1;97m[ Controller Thread ] :\033[0m "
+                        "\033[1;92mINFO\033[0m - Mode → AUTO"
+                    )
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # LIFECYCLE
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def try_unsubscribe(self):
+        try:
+            for sub in self.subscribe_list:
+                try:
+                    sub.unsubscribe()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def stop(self):
+        self.try_unsubscribe()
+        self.control_mode = ControlMode.INIT
+        self.steerMotorSender.send("0")
+        self.speedMotorSender.send("0")
+        # time.sleep(0.1)
+        self.stateMachine.request_mode("dashboard_stop_button")
+        # time.sleep(0.1)
+        super(threadcontroller, self).stop()
+
+    def stopTOF(self):
+        self.control_mode = ControlMode.AUTO
+        self.steerMotorSender.send("0")
+        self.speedMotorSender.send("0")
+        # time.sleep(0.1)
+        self.stateMachine.request_mode("TOF_stop")
+        # time.sleep(0.1)
+        super(threadcontroller, self).stopTOF()
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # HELPERS — Motor
+    # ─────────────────────────────────────────────────────────────────────────
+    def _log_once(self, message):
+        """Prints a message only if it's different from the last printed mode."""
+        if self.control_mode != self._last_printed_mode:
+            print(f"\033[1;34m[ MODE ]\033[0m {message}")
+            self._last_printed_mode = self.control_mode
+
+    def _send_speed(self, value: int):
+        self._last_speed = value
+        self.speedMotorSender.send(str(int(value)))
+
+    def _apply_lane_keeping(self, visionRecv, axesRecv, speed_override=None, side="center"):
+        if speed_override is not None:
+            self._send_speed(speed_override)
+        elif axesRecv is not None:
+            tv = map_range(
+                float(axesRecv["throttle"]), 0.0, AXES_MAX, THROTTLE_MIN, THROTTLE_MAX
+            )
+            if abs(tv) < THROTTLE_DEADBAND:
+                tv = 0.0
+            self._send_speed(int(tv))
+
+        if not hasattr(self, "_last_steering_cmd"):
+            self._last_steering_cmd = "0"
+
+        if visionRecv is not None:
+            key = {
+                "left":"steering_left",
+                "right":"steering_right",
+                "center": "steering_center",
+            }.get(side, "steering_center")
+            raw = visionRecv.get(key) or visionRecv.get("steering", "250")
+            sv = constrain_num(
+                map_range(float(raw), 0.0, 500.0, float(STEERING_MIN), float(STEERING_MAX)),
+                STEERING_MIN,
+                STEERING_MAX,
+            )
+            self._last_steering_cmd = str(int(sv))
+
+
+        # ALWAYS send the command so the motor holds its position
+        self.steerMotorSender.send(self._last_steering_cmd)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # HELPERS — Parking
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _set_scan_gate(self, active: bool):
+        if self._park_scan_active != active:
+            self._park_scan_active = active
+            self.parkingScanSender.send(active)
+            print(f">>> [SCAN GATE] {'ON' if active else 'OFF'}")
+
+    def _update_tof_state(self, side: str, raw_value):
+        """
+        Push a new reading into the rolling buffer for the given side
+        ('left' or 'right') and update the hysteresis-based free/occupied
+        state.  Returns the current boolean free-state (or None if the
+        buffer is still warming up).
+        """
+        buf = self._tof_left_buf if side == "left" else self._tof_right_buf
+        state_attr = "_tof_left_free" if side == "left" else "_tof_right_free"
+
+        buf.append(raw_value)
+
+        current = getattr(self, state_attr)
+
+        # ── Asymmetric hysteresis ─────────────────────────────────────────────
+        # FREE → OCC : instant (1 reading) — never miss a parked car
+        # OCC → FREE : slow   (full median buffer) — never commit to wrong spot
+
+        if current is True:
+            # Currently FREE — go OCC immediately on a single low reading
+            if raw_value < TOF_FREE_LOW:
+                setattr(self, state_attr, False)
+                buf.clear()  # flush buffer so old FREE readings don't linger
+        else:
+            # Currently OCC — need full buffer median to confirm FREE
+            if len(buf) >= max(1, TOF_BUFFER_SIZE // 2):
+                median = float(np.median(buf))
+                if median > TOF_FREE_HIGH:
+                    setattr(self, state_attr, True)
+
+        return getattr(self, state_attr)
+
+    def _reset_parking_timers(self):
+        self._park_sign_seen_time = None
+        self._park_seen_wall = False
+        self._park_side = None
+        self._park_free_confirm = None
+        self._park_all_free_timer = None
+        self._park_position_start = None
+        self._park_reverse_start = None
+        self._park_correct_start = None
+        self._park_fwd_start = None
+        self._park_stop_time = None
+        self._parking_spot_detection_time = None
+        self._parking_move_fwd_bfr_maneuver = None
+        self._park_blind_enter_time = None
+        self._last_parking_condition = None
+        self._park_grace_counter = 0
+        # Transition counters
+        self._occ_frames_left = 0
+        self._occ_frames_right = 0
+        self._free_frames_left = 0
+        self._free_frames_right = 0
+        self._wall_seen_left = False
+        self._wall_seen_right = False
+        self._park_commit_time = None
+        self._park_align_start = None
+        self._free_timer_left = None
+        self._free_timer_right = None
+        self._set_scan_gate(False)
+
+    def _commit_to_bay(self, side: str, reason: str):
+        print("=" * 55)
+        print(f">>> [FIND_SPOT] ΘΕΣΗ {side.upper()} ΕΠΙΛΕΧΘΗΚΕ ({reason})")
+        print("=" * 55)
+        self._park_side = side
+        self._park_free_confirm = None
+        self._park_all_free_timer = None
+        self._park_seen_wall = False
+        self._park_position_start = None
+        self.control_mode = ControlMode.PARKING_POSITION
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # HELPERS — V2X + Path Planning
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _update_semaphores(self, recv):
+        if recv is None:
+            return
+        sid = recv.get("id", "?")
+        self.semaphore_states[sid] = recv
+        if self.semaphore_states:
+            nearest = min(
+                self.semaphore_states.values(),
+                key=lambda s: (s["x"] - self.car_x) ** 2 + (s["y"] - self.car_y) ** 2,
+            )
+            self.nearest_semaphore_state = nearest["state"]
+
+    def _update_location(self, recv):
+        if recv is None:
+            return
+        print(f"[LOC] x={recv['x']:.3f} y={recv['y']:.3f}")
+        self.car_x = recv["x"]
+        self.car_y = recv["y"]
+        self.loc_quality = recv["quality"]
+
+        # --- MISSED INTERSECTION QUEUE SKIPPER ---
+        if self.planner and getattr(self.planner, 'G', None):
+            best_dist = float('inf')
+            nearest_int_node = None
+            
+            for node in getattr(self, 'INTERSECTION_NODES', []):
+                if node in self.planner.G.nodes:
+                    nx_x = float(self.planner.G.nodes[node]["x"])
+                    nx_y = float(self.planner.G.nodes[node]["y"])
+                    dist = np.hypot(nx_x - self.car_x, nx_y - self.car_y)
+                    if dist < best_dist:
+                        best_dist = dist
+                        nearest_int_node = node
+            
+            # 1. Entering the 1-meter radius
+            if best_dist < 1.0:
+                if getattr(self, '_current_near_int_node', None) is None:
+                    self._current_near_int_node = nearest_int_node
+                    
+            # 2. Exiting the 1-meter radius
+            elif best_dist >= 1.0 and getattr(self, '_current_near_int_node', None) is not None:
+                passed_node = self._current_near_int_node
+                self._current_near_int_node = None # Clear memory
+                
+                # If we passed it while still in AUTO (meaning no turn state was ever triggered)
+                if self.control_mode in [ControlMode.AUTO, ControlMode.MOVE]:
+                    if time.time() > getattr(self, "_ignore_intersections_until", 0):
+                        print(f"\033[1;93m>>> [NAV] Passed intersection {passed_node} without turning. Skipping command: {self.next_instruction.upper()}\033[0m")
+                        
+                        if hasattr(self, 'maneuver_queue') and len(self.maneuver_queue) > 0:
+                            next_cmd = self.maneuver_queue.pop(0)
+                            self.next_instruction = next_cmd.replace("TURN_", "").replace("GO_", "").lower()
+                            print(f">>> [NAV] Chamber reloaded with next: {self.next_instruction.upper()}")
+                        else:
+                            self.next_instruction = "straight"
+        # -----------------------------------------
+
+        print("ATTEMPTING SHARED MEMORY")
+        if self.shared_mem is not None:
+            self.shared_mem.insert("devicePos", [self.car_x, self.car_y])
+            self.shared_mem.insert("deviceSpeed", [abs(self._last_speed)])
+            print(f"DEVICE POS: {[self.car_x, self.car_y]}")
+        else:
+            print("SHARED MEMORY NONE")
+        # ... (rest of the method remains exactly the same)
+
+    def _update_path_progress(self):
+        if self.planner is None:
+            return
+
+        if not self.current_path:
+            nearest = self.planner.find_nearest_node(self.car_x, self.car_y)
+            if nearest and nearest != self.target_node_id:
+                self.current_path = self.planner.dijkstra(nearest, self.target_node_id)
+                self.current_node_idx = 0
+                if self.debugging:
+                    print(
+                        f"[ PathPlanner ] {self.planner.path_info(self.current_path)}"
+                    )
+            return
+
+        if self.current_node_idx < len(self.current_path):
+            wid = self.current_path[self.current_node_idx]
+            dist = self.planner.distance_to_node(self.car_x, self.car_y, wid)
+            if dist < WAYPOINT_THRESHOLD:
+                self.current_node_idx += 1
+
+        if self.current_node_idx >= len(self.current_path):
+            dist_cp = self.planner.distance_to_node(
+                self.car_x, self.car_y, self.target_node_id
+            )
+            if dist_cp < WAYPOINT_THRESHOLD * 2:
+                print(
+                    f"\033[1;97m[ PathPlanner ] :\033[0m \033[1;92mINFO\033[0m"
+                    f" - ✓ Target node {self.target_node_id} REACHED"
+                )
+                if self._fixed_target:
+                    self._fixed_target = False
+                    self._send_speed(0)
+                    self.steerMotorSender.send("0")
+                    print(
+                        "\033[1;97m[ PathPlanner ] :\033[0m \033[1;92mINFO\033[0m"
+                        " - Fixed-target navigation complete. Car stopped."
+                    )
+                    return
+                self._advance_checkpoint()
+                return
+
+        self.path_heading = self.planner.heading_to_next(
+            self.current_path, self.current_node_idx
+        )
+
+    def _report_obstacles(self):
+        if self.shared_mem is None:
+            return
+        for det in self.detections:
+            obs_id = OBSTACLE_IDS.get(det.get("label", ""))
+            if obs_id is not None:
+                self.shared_mem.insert("historyData", [obs_id, self.car_x, self.car_y])
+
+    def _send_telemetry(self):
+        if self._telem_sock is None:
+            return
+        try:
+            payload = json.dumps(
+                {
+                    "mode": self.control_mode.name,
+                    "detections": self.detections,
+                    "car_x": self.car_x,
+                    "car_y": self.car_y,
+                    "checkpoint": self._checkpoint_idx,
+                    "target_node": self.target_node_id,
+                    "path_len": len(self.current_path),
+                    "heading": self.path_heading,
+                }
+            ).encode()
+            self._telem_sock.sendto(payload, (self._telem_ip, self._telem_port))
+        except Exception:
+            pass
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # MAIN LOOP
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def thread_work(self):
+        try:
+            # =================================================================
+            # POLL
+            # =================================================================
+
+            self.state_change_handler()
+
+            klemRecv = self.klSubscriber.receive()
+            buttonRecv = self.joyButtonSubscriber.receive()
+            axesRecv = self.joyAxesSubscriber.receive()
+            visionRecv = self.visionManeuverSubscriber.receive()
+            tofRearRecv = self.tofRearSubscriber.receive()
+            tofLeftRecv = self.tofLeftSubscriber.receive()
+            tofRightRecv = self.tofRightSubscriber.receive()
+            tofForwardRecv = self.tofForwardSubscriber.receive()
+            objectDetectRecv = self.objectDetectSubscriber.receive()
+            semaphoresRecv = self.semaphoresSubscriber.receive()
+            locationRecv = self.locationSubscriber.receive()
+            navigateToRecv = self.navigateToSubscriber.receive()
+            currentSpeedRecv = self.currentSpeedSubscriber.receive()
+            imuRecv = self.imuSubscriber.receive()
+            intersectionMaskRecv = self.intersectionMaskSubscriber.receive()
+            leftLineClassifierRecv = self.leftLineClassifierSubscriber.receive()
+            rightLineClassifierRecv = self.rightLineClassifierSubscriber.receive()
+            # navCommandRecv = self.navCommandSubscriber.receive()
+
+            # if leftLineClassifierRecv is not None:
+            #     print(f"[LeftLineClassifier] {leftLineClassifierRecv}")
+            # if rightLineClassifierRecv is not None:
+            #     print(f"[RightLineClassifier] {rightLineClassifierRecv}")
+
+            if imuRecv is not None:
+                data = ast.literal_eval(
+                    imuRecv
+                )  # stupid string becomes smart dictionary
+                yaw = float(data["yaw"])
+                self.current_yaw = yaw  # <--- ΠΡΟΣΘΗΚΗ: Το σώζουμε για το State Machine
+                self.sharedMemory.insert("deviceRot", [yaw])
+
+
+
+
+
+
+
+
+
+
+
+
+            if currentSpeedRecv is not None:
+                currentSpeedRecv = currentSpeedRecv / 10
+                self.sharedMemory.insert(
+                    "deviceSpeed", [round(currentSpeedRecv), 2]
+                )  # send a speed to the server
+
+            # ── Navigator Commands ─────────────────────────────────────────
+
+            if self.navCommandSubscriber.is_data_in_pipe(): # <--- THIS IS CRITICAL
+                navCommandRecv = self.navCommandSubscriber.receive()
+                
+                sequence = navCommandRecv.get("maneuver_sequence")
+                lane_pref = navCommandRecv.get("lane_preference")
+                stop_cmd = navCommandRecv.get("command")
+                
+                if lane_pref is not None:
+                    self.lane_preference = lane_pref
+
+                if stop_cmd == "STOP_AT_DESTINATION":
+                    print("\033[1;95m>>> [ NAVIGATOR ] DESTINATION REACHED. STOPPING.\033[0m")
+                    self.control_mode = ControlMode.INIT
+
+                if sequence is not None:
+                    print(f"\033[1;95m>>> [ NAVIGATOR ] Queue Loaded: {sequence}\033[0m")
+                    self.maneuver_queue = sequence
+                    
+                    # Pre-load the immediate next turn
+                    if len(self.maneuver_queue) > 0:
+                        next_cmd = self.maneuver_queue.pop(0)
+                        # String magic: turns "TURN_LEFT" into "left", "GO_STRAIGHT" into "straight"
+                        self.next_instruction = next_cmd.replace("TURN_", "").replace("GO_", "").lower()
+
+            # ── Cache ToF ─────────────────────────────────────────────────
+            if tofRearRecv is not None:
+                self.tof_rear = tofRearRecv
+                #self._update_tof_state("rear", tofRearRecv)  # rear also gets hysteresis, for parking exit
+            if tofForwardRecv is not None:
+                self.tof_forward = tofForwardRecv
+                #self._update_tof_state("forward", tofForwardRecv)
+            if tofLeftRecv is not None:
+                self.tof_left = tofLeftRecv
+                self._update_tof_state("left", tofLeftRecv)
+            if tofRightRecv is not None:
+                self.tof_right = tofRightRecv
+                self._update_tof_state("right", tofRightRecv)
+
+            #print(f"TOF L/R/Fwd/Aft: {self.tof_left} / {self.tof_right} / {self.tof_forward} / {self.tof_rear}")
+            #print(f"TOF L/R/F/R: {self.tof_left} / {self.tof_right} / {self.tof_forward} / {self.tof_rear}")
+
+            # ── Update detections ─────────────────────────────────────────
+            if objectDetectRecv is not None:
+                # 1. We got fresh data from the camera, save it!
+                self.detections = (
+                    objectDetectRecv
+                    if isinstance(objectDetectRecv, list)
+                    else [objectDetectRecv]
+                )
+                detected_labels = [
+                    d.get("label") for d in self.detections if d is not None
+                ]
+                # if len(detected_labels) > 0:
+                # print(f"[BRAIN SEES]: {detected_labels}")
+
+                # if "start" in detected_labels:
+                # --------------------------------------------------------------
+                self._last_detection = self.detections  # Update our memory
+
+                self._report_obstacles()
+            else:
+                # 2. Queue was empty (camera still processing), use our memory!
+                self.detections = (
+                    self._last_detection if self._last_detection is not None else []
+                )
+
+            # 3. Print the active memory we are using to drive, NOT the empty queue pull
+            # print(f"ObjectDetect: {self.detections}")
+
+            # ── V2X updates ───────────────────────────────────────────────
+            self._update_semaphores(semaphoresRecv)
+            self._update_location(locationRecv)
+
+            # ── Navigate-to command from dashboard ────────────────────────
+            if navigateToRecv is not None:
+                target = str(navigateToRecv.get("target", "")).strip()
+                if target and self.planner and target in self.planner._pos:
+                    self.target_node_id = target
+                    self.current_path = []
+                    self.current_node_idx = 0
+                    self._fixed_target = True
+                    print(
+                        f"\033[1;97m[ PathPlanner ] :\033[0m \033[1;92mINFO\033[0m"
+                        f" - NavigateTo → node {target}"
+                    )
+                else:
+                    print(
+                        f"\033[1;97m[ PathPlanner ] :\033[0m \033[1;93mWARN\033[0m"
+                        f" - NavigateTo: unknown node '{target}'"
+                    )
+
+            # =================================================================
+            # PREPARE
+            # =================================================================
+            if klemRecv is not None:
+                self._klem_received = True
+                prev = self.act_enabled
+                match str(klemRecv):
+                    case "30":
+                        self.act_enabled = True
+                    case _:
+                        self.act_enabled = False
+                if prev != self.act_enabled:
+                    print(f"\033[1;96m[KLEM]\033[0m act_enabled={self.act_enabled}")
+            else:
+                if not self._klem_received:
+                    self.act_enabled = True
+
+            if buttonRecv is not None:
+                match int(buttonRecv):
+                    case 0:
+                        self.stateMachine.request_mode("dashboard_stop_button")
+                    case 1:
+                        self.stateMachine.request_mode("dashboard_manual_button")
+                    case 2:
+                        self.stateMachine.request_mode("dashboard_legacy_button")
+                    case 3:
+                        self.stateMachine.request_mode("dashboard_auto_button")
+
+            # =================================================================
+            # ACT — state machine
+            # =================================================================
+            match self.control_mode:
+
+                # ── INIT ──────────────────────────────────────────────────────
+                case ControlMode.INIT:
+                    self.steerMotorSender.send("0")
+                    self._send_speed(0)
+                    self.control_mode = ControlMode.IDLE
+                    time.sleep(0.03)
+
+                # ── IDLE ──────────────────────────────────────────────────────
+                case ControlMode.IDLE:
+                    
+                    self.control_mode = ControlMode.START
+                    
+
+                # ── MANUAL ────────────────────────────────────────────────────
+                case ControlMode.MANUAL:
+                    if self.act_enabled and axesRecv is not None:
+                        sv = map_range(
+                            float(axesRecv["steering"]),
+                            0.0,
+                            AXES_MAX,
+                            STEERING_MIN,
+                            STEERING_MAX,
+                        )
+                        tv = map_range(
+                            float(axesRecv["throttle"]),
+                            0.0,
+                            AXES_MAX,
+                            THROTTLE_MIN,
+                            THROTTLE_MAX,
+                        )
+                        if abs(sv) < STEERING_DEADBAND:
+                            sv = 0.0
+                        if abs(tv) < THROTTLE_DEADBAND:
+                            tv = 0.0
+                        self.steerMotorSender.send(
+                            str(int(constrain_num(sv, STEERING_MIN, STEERING_MAX)))
+                        )
+                        self._send_speed(
+                            int(constrain_num(tv, THROTTLE_MIN, THROTTLE_MAX))
+                        )
+                        time.sleep(0.03)
+
+                # ── AUTO ──────────────────────────────────────────────────────
+                case ControlMode.AUTO:
+                    self._log_once("AUTO mode")
+                    if self.act_enabled:
+                        if time.time() < getattr(self, "_ignore_intersections_until", 0):
+                            self.detections = [
+                                obj for obj in self.detections 
+                                if obj is not None and obj.get("label") not in ["Stop", "Priority", "TrafficLight", "STOP_LINE", "Crosswalk"]
+                            ]
+
+                        if self.nearest_semaphore_state == 0:  # RED
+                            self.steerMotorSender.send("0")
+                            self._send_speed(0)
+                            if self.debugging:
+                                print("[ SEMAPHORE ] RED → STOP")
+                            self._send_telemetry()
+                            return
+
+                        # Lane keeping
+                        self._apply_lane_keeping(visionRecv, axesRecv, NORMAL_SPEED, side=self.lane_preference)
+
+                        # PRIORITY 1. ENSURE PEDESTRIAN SAFETY
+                        # ALL OTHER CONSIDERATIONS SECONDARY
+                        # SANITY EXPENDABLE
+                        start_seen = False
+
+                        # if any(
+                        #         start_seen == False
+                        #         and obj is not None
+                        #         and obj.get("label") == "start"
+                        #         and obj.get("proximity") in ("CLOSE", "MEDIUM")
+                        #         for obj in self.detections 
+                        #     ): 
+                        #     start_seen = True
+                        #     print("start")
+
+                        #     self.control_mode = ControlMode.START
+
+
+
+                        if any(
+                            obj is not None
+                            and obj.get("label") == "Pedestrian"
+                            and obj.get("proximity") == "CLOSE"
+                            for obj in self.detections
+                        ) and not any(
+                            obj is not None and obj.get("label") == "Crosswalk"
+                            for obj in self.detections
+                        ):
+                            self.control_mode = ControlMode.SIMPLE_PEDESTRIAN
+
+                        # Priority 2
+                        elif (
+                            any(
+                                obj is not None
+                                and obj.get("label") == "Stop"
+                                and obj.get("proximity") in ("CLOSE", "MEDIUM", "FAR")
+                                for obj in self.detections
+                            )
+                            or self._searching_for_stop_line
+                        ):
+
+                            if any(
+                                obj is not None
+                                and obj.get("label") == "Stop"
+                                and obj.get("proximity") in ("CLOSE", "MEDIUM")
+                                for obj in self.detections
+                            ):
+                                print(
+                                    ">>> Stop sign detected → searching for stop line"
+                                )
+                            self._searching_for_stop_line = True
+                            self.control_mode = ControlMode.FIND_STOP_LINE
+
+                        # Priority 2 — Pedestrian + Crosswalk
+                        elif any(
+                            obj is not None
+                            and obj.get("label") == "Pedestrian"
+                            and obj.get("proximity") in ("CLOSE", "MEDIUM")
+                            for obj in self.detections
+                        ) and any(
+                            obj is not None
+                            and obj.get("label") == "Crosswalk"
+                            and obj.get("proximity") in ("CLOSE", "MEDIUM")
+                            for obj in self.detections
+                        ):
+                            self.control_mode = (
+                                ControlMode.MOVE_FOR_PEDESTRIAN_IN_CROSSWALK
+                            )
+
+                        # Priority 3 — Green light (proceed but prepare to stop at stop line)
+                        elif any(
+                            obj is not None
+                            and "traffic" in obj.get("label", "").lower()
+                            and obj.get("proximity") in ("CLOSE", "MEDIUM", "FAR")
+                            for obj in self.detections
+                        ) and not any(
+                            obj is not None and obj.get("label") == "GreenLight"
+                            for obj in self.detections
+                        ):
+                            print(
+                                ">>> Traffic light detected but NOT green → prepare to stop at stop line"
+                            )
+                            self._searching_for_stop_line = True
+                            self.control_mode = ControlMode.FIND_STOP_LINE
+
+                        # Priority 4 — Priority (pass through directly to intersection)
+                        elif any(
+                            obj is not None
+                            and obj.get("label") == "Priority"
+                            and obj.get("proximity") in ("CLOSE", "MEDIUM", "FAR")
+                            for obj in self.detections
+                        ):
+                            self._log_once("PRIORITY SIGN -> ENTER INTERSECTION")
+                            self.control_mode = ControlMode.ENTER_INTERSECTION
+
+                        # Priority 5 — Highway
+                        elif any(
+                            obj is not None
+                            and obj.get("label") == "HighwayEntry"
+                            and obj.get("proximity") == "CLOSE"
+                            for obj in self.detections
+                        ):
+                            
+                            self.control_mode = ControlMode.ENTER_HIGHWAY
+
+                        # Priority 6 — Parking
+                        elif any(
+                            obj is not None
+                            and obj.get("label") == "Parking"
+                            and obj.get("proximity") in ("CLOSE")
+                            for obj in self.detections
+                        ):
+                            self._log_once("PARKING SIGN DETECTED → prepare to park")
+                            self.control_mode = ControlMode.ENTER_PARKING
+
+                        # elif not self._has_started and any(
+                        #     obj is not None and obj.get("label") == "start"
+                        #     for obj in self.detections
+                        # ):
+                        #     print(">>> START LINE DETECTED -> Locking in START mode! <<<")
+                        #     self.control_mode = ControlMode.START
+
+                        # Priority 7 — Overtake
+                        elif any(
+                            obj is not None
+                            and obj.get("label") == "Car"
+                            and obj.get("distance_m") is not None
+                            and (obj.get("distance_m") < 0.6 or self.tof_forward < 400)
+                            and obj.get("bearing_deg") is not None
+                            and abs(obj.get("bearing_deg")) < 10
+                            for obj in self.detections
+                            
+                        ):
+                            self._log_once(
+                                "OVERTAKE: Car detected ahead within 0.7m and 20° bearing → prepare to overtake"
+                            )
+
+                            if(leftLineClassifierRecv == "dashed"):
+                                self._log_once("OVERTAKE (VEER LEFT)")
+                                print(self.tof_forward)
+                                self.control_mode = ControlMode.OVERTAKE_LEFT
+                        
+                            elif(rightLineClassifierRecv == "dashed"):
+                                self._log_once("OVERTAKE (VEER RIGHT)")
+                                print(self.tof_forward)
+                                self.control_mode = ControlMode.OVERTAKE_RIGHT
+                                
+                            else:
+                                pass
+                                #self.control_mode = ControlMode.AVOID_CAR
+
+                        # ── ROUNDABOUT TRIGGER (ΝΕΟ) ───────────────────
+                        elif any(
+                            obj is not None and obj.get("label") == "Roundabout" and obj.get("proximity") in ("CLOSE", "MEDIUM")
+                            for obj in self.detections
+                        ):
+                            self._log_once("ROUNDABOUT SIGN DETECTED → Dynamic Approach")
+                            
+                            instruction = str(self.next_instruction).lower().strip()
+                            
+                            if instruction == "right":
+                                self.target_roundabout_exit = 1
+                            elif instruction in ["front", "straight"]:
+                                print(f">>> [ROUNDABOUT] Εντολή: '{instruction}'. Στόχος: Ευθεία (Έξοδος 2)")
+                                self.target_roundabout_exit = 2
+                            elif instruction == "left":
+                                self.target_roundabout_exit = 3
+                            elif instruction == "u_turn":
+                                self.target_roundabout_exit = 4
+                            else:
+                                print(f">>> [ROUNDABOUT] NavCommand: '{instruction}'. Εφαρμογή DEFAULT: Ευθεία (Έξοδος 2)")
+                                self.target_roundabout_exit = 2
+                                
+                            self.control_mode = ControlMode.ROUNDABOUT_APPROACH
+
+
+                        # # ── STOP LINE TRIGGER ──────────────────────────
+                        # elif any(
+                        #     obj is not None
+                        #     and obj.get("label") in ["STOP_LINE"]
+                        #     for obj in self.detections
+                        # ) and not any(
+                        #     obj is not None 
+                        #     and obj.get("label") == "Crosswalk"
+                        #     for obj in self.detections
+                        # ) and not any(
+                        #     obj is not None 
+                        #     and obj.get("label") == "CROSSWALK"
+                        #     for obj in self.detections
+                        # ):
+                        #     self._log_once("STOP LINE DETECTED -> DIRECT INTERSECTION")
+                        #     self.control_mode = ControlMode.DIRECT_INTERSECTION
+
+                        else:
+                            self._park_sign_seen_time = None
+                            self.control_mode = ControlMode.AUTO
+
+                # ── FIND_STOP_LINE ──────────────────────────────────
+                case ControlMode.FIND_STOP_LINE:
+                    self._log_once("FIND STOP LINE")
+
+                    # --- FAIL-SAFE: If we accidentally 

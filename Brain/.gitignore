@@ -1,0 +1,7 @@
+docs/build/
+.vscode/
+__pycache__
+**/*.pyc
+/src/dashboard/frontend/node_modules
+# Angular build cache
+.angular/
